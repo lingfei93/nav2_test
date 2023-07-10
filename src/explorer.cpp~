@@ -1,0 +1,1316 @@
+#include <chrono>
+#include <cstdlib>
+#include <functional>
+#include <memory>
+#include <string>
+#include <cmath>
+#include <fstream>
+#include <ctime>
+#include <boost/lexical_cast.hpp>  
+#include <unistd.h>
+#include <sys/types.h>
+#include <pwd.h>
+
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "std_msgs/msg/string.hpp"
+
+#include "nav2_msgs/action/navigate_to_pose.hpp"
+#include "nav2_util/geometry_utils.hpp"
+
+#include "tf2_msgs/msg/tf_message.hpp"
+#include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_ros/buffer.h"
+#include "tf2/utils.h"
+#include <tf2/exceptions.h>
+
+#include "nav2_util/geometry_utils.hpp"
+#include "nav2_util/robot_utils.hpp"
+
+#include "std_msgs/msg/header.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/map_meta_data.hpp"
+#include <nav_msgs/msg/odometry.hpp>
+
+#include "leica_interfaces/srv/start_leica_scan.hpp"
+
+#include "cv_bridge/cv_bridge.h"
+#include <opencv2/opencv.hpp>
+
+#include "PathFinder.h"
+#include "AStar.h"
+
+using namespace std::chrono_literals;
+
+// Global Variables
+struct goal {
+  double x_coord;
+  double y_coord;
+  int goal_status;
+} ;
+
+struct image_goal {
+  int i_coord;
+  int j_coord;
+} ;
+
+struct debug_goal {
+  double x_coord;
+  double y_coord;
+  double preference_value;
+} ;
+
+// Debug (Global)
+std::vector<debug_goal> g_debug_goal_vector;
+double g_debug_most_preferred_grid_value;
+
+// Control (Global)
+bool g_isNavigating = false;
+bool g_isCurrPoseAvailable = false;
+bool g_isMappingEnded=false;
+bool g_wasPreviouslyNavigating = false;
+bool g_isHoldingState = true;
+bool g_isReturningToOrigin = false;
+int g_path_count = 0, g_end_mapping_count = 0;
+int g_marker_im_counter = 0;
+int g_num_of_times_failed = 0;
+double g_curr_x,g_curr_y, g_resolution, g_origin_x, g_origin_y;
+double g_prev_x = 10000, g_prev_y = 10000; // Initialise to impossible value
+std::vector<goal> g_goals_sent_vector;
+std::vector<goal> g_goals_explored_vector;
+goal g_curr_goal;
+
+// Admin (Global)
+std::string g_mission_name;
+std::string g_homedir_string;
+goal g_prev_scan_goal;
+std::vector<goal> g_goals_scanned_vector;
+
+
+/*
+Create our own class deriving AStarNode.
+This is needed for applying A* Algorithm to our squares.
+*/
+class Square : public AStarNode
+{
+  public:
+
+    Square()
+    {}
+
+    ~Square()
+    {}
+
+    void setType(const bool type)
+    {
+      m_type = type;
+    }
+
+    bool getType() const
+    {
+      return m_type;
+    }
+
+    // A diagonal move has a sqrt(2) cost, 1 otherwise
+    float localDistanceTo(AStarNode* node) const
+    {
+      if(node->getX() != m_x && node->getY() != m_y)
+        return 1.41421356237f;
+      else
+        return 1.0f;
+    }
+
+    float distanceTo(AStarNode* node) const
+    {
+      int newW = m_x - node->getX(), newH = m_y - node->getY();
+      return sqrtf( static_cast<float>(newW*newW + newH*newH) );
+    }
+
+  private:
+    // To tell wether a pixel is "walkable" or not
+    bool m_type;
+};
+
+
+class MapExplorer : public rclcpp::Node
+{
+  public:
+  
+    using NavigateToPose = nav2_msgs::action::NavigateToPose;
+    using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
+
+    MapExplorer(): Node("minimal_publisher")
+    {
+      navigation_action_client_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
+      map_subscription_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>("map",0.05, std::bind(&MapExplorer::autosavemap_callback, this, std::placeholders::_1));
+      
+      rclcpp::QoS qos(10);
+      qos.keep_last(10);
+      qos.best_effort();
+      qos.durability_volatile();
+      odom_subscription_ = this->create_subscription<nav_msgs::msg::Odometry>("odom", qos,std::bind(&MapExplorer::odom_callback, this, std::placeholders::_1));
+
+      // Static publisher
+      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+      transform_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+      rclcpp::QoS qos_reliable(10);
+      qos_reliable.keep_last(10);
+      qos_reliable.reliable();
+      qos_reliable.durability_volatile();
+
+      // Master node control interfaces
+      explorermain_subscription_ = this->create_subscription<std_msgs::msg::String>("explorer_main_topic",qos_reliable, std::bind(&MapExplorer::explorermain_callback, this, std::placeholders::_1));
+      explorernavigation_subscription_ = this->create_subscription<std_msgs::msg::String>("explorer_navigation_topic",qos_reliable, std::bind(&MapExplorer::explorernavigation_callback, this, std::placeholders::_1));
+      
+      cmdvel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel", 10);
+      to_master_publisher_ = this->create_publisher<std_msgs::msg::String>("explorer_to_master_topic", qos_reliable);
+    
+      this->declare_parameter("search_grid_param.double_row_width");
+      this->declare_parameter("search_grid_param.double_col_height");
+      this->declare_parameter("search_grid_param.double_step_size");
+      this->declare_parameter("mapping_param.int_free_cell_threshold");
+      this->declare_parameter("mapping_param.int_occupied_cell_lower_threshold");
+      this->declare_parameter("mapping_param.int_occupied_cell_upper_threshold");
+      this->declare_parameter("mapping_param.int_unknown_cell_threshold");
+      this->declare_parameter("image_param.int_white_pixel_value");
+      this->declare_parameter("image_param.int_grey_pixel_value");
+      this->declare_parameter("image_param.int_black_pixel_value");
+      this->declare_parameter("optimization_param.double_robot_radius");
+      this->declare_parameter("optimization_param.double_dist_too_near_metres");
+      this->declare_parameter("optimization_param.int_non_explorable_grid_weight");
+      this->declare_parameter("optimization_param.double_dist_weight");
+      this->declare_parameter("optimization_param.double_safety_factor");
+      this->declare_parameter("optimization_param.double_occupied_pixel_weight");
+      this->declare_parameter("optimization_param.double_free_pixel_weight");
+      this->declare_parameter("optimization_param.double_unknown_pixel_weight");
+      this->declare_parameter("optimization_param.double_bad_goal_preference_value");
+      this->declare_parameter("optimization_param.double_faction_of_unknown");
+      this->declare_parameter("local_goal_selection_param.double_local_exploration_scope");
+      this->declare_parameter("local_goal_selection_param.double_step_size");
+      this->declare_parameter("a_star_search_algorithm_param.int_rejected_path_metres");
+      this->declare_parameter("region_explored_param.double_exploration_tolerance");
+      this->declare_parameter("region_explored_param.double_misalignment_allowance");
+      this->declare_parameter("mark_key_location_param.int_radius_of_mark");
+      this->declare_parameter("mark_key_location_param.int_thickness_of_circle");
+      this->declare_parameter("navigation_status_param.double_scan_distance_threshold");
+      this->declare_parameter("navigation_status_param.double_fail_distance_metres");
+      this->declare_parameter("navigation_status_param.double_scan_despite_failure_tolerance_metres");
+      this->declare_parameter("navigation_status_param.int_num_of_retries_allowed");
+    }
+
+  private:
+  
+    rclcpp_action::Client<NavigateToPose>::SharedPtr navigation_action_client_;
+    rclcpp_action::ClientGoalHandle<NavigateToPose>::SharedPtr navigation_goal_handle_;
+    rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_subscription_; 
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr explorermain_subscription_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr explorernavigation_subscription_;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmdvel_publisher_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr to_master_publisher_;
+    std::shared_ptr<tf2_ros::TransformListener> transform_listener_{nullptr};
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::string target_frame_;
+
+    void master_node_feedback(std::string msg){
+      auto feedback_message = std_msgs::msg::String();
+      feedback_message.data = msg;
+      to_master_publisher_ -> publish(feedback_message);
+    }
+    
+    void explorermain_callback(const std_msgs::msg::String::SharedPtr msg){
+      std::string explorer_main_msg;
+      explorer_main_msg = msg->data.c_str();
+      RCLCPP_INFO(this->get_logger(), "explorermain_callback: '%s'", explorer_main_msg.c_str());
+
+      if (explorer_main_msg == "start"){
+        RCLCPP_INFO(this->get_logger(), "Mission starting..");
+        master_node_feedback("Mission starting..");
+        
+        goal initial_goal;
+        initial_goal.x_coord = 0.0;
+        initial_goal.y_coord = 0.0;
+        g_goals_scanned_vector.push_back(initial_goal);	
+
+        // Spin the robot 720 degrees
+        geometry_msgs::msg::Twist msg;
+        msg.angular.z = 1.0;
+
+        int count = 0;
+        while (count < 1000){ // prev: count = 1500
+          cmdvel_publisher_->publish(msg);
+          count++;
+          rclcpp::sleep_for(10ms);
+        }
+        
+        // Stop the robot from spinning
+        msg.angular.z = 0.0;
+        cmdvel_publisher_->publish(msg);
+        rclcpp::sleep_for(1s);
+
+        g_isHoldingState = false;
+      }
+      else if (explorer_main_msg == "hold"){
+        RCLCPP_INFO(this->get_logger(), "Robot is on hold");
+        g_isHoldingState = true;
+
+      }
+      else if (explorer_main_msg == "release"){
+        RCLCPP_INFO(this->get_logger(), "Robot is free to navigate");
+        g_isHoldingState = false;
+        
+      }
+      else if (explorer_main_msg == "end"){
+        RCLCPP_INFO(this->get_logger(), "Mission ended by operator");
+        // Stop all movement
+        navigation_action_client_->async_cancel_all_goals();
+        exit(6);        
+      }
+      else{
+        RCLCPP_INFO(this->get_logger(), "Invalid message");
+        ; // Do nothing
+      }
+    }
+    
+    void explorernavigation_callback(const std_msgs::msg::String::SharedPtr msg){
+      std::string explorer_nav_msg;
+      explorer_nav_msg = msg->data.c_str();
+      RCLCPP_INFO(this->get_logger(), "explorernavigation_callback: '%s'", explorer_nav_msg.c_str());
+
+      if (explorer_nav_msg  == "pause"){
+        RCLCPP_INFO(this->get_logger(), "Robot is paused");
+        if (g_isNavigating){
+          navigation_action_client_->async_cancel_all_goals();
+          g_wasPreviouslyNavigating = true;
+        }
+        else {
+          g_wasPreviouslyNavigating = false;
+        }
+      }
+      else if (explorer_nav_msg == "unpause"){
+        if(!g_isMappingEnded){
+          RCLCPP_INFO(this->get_logger(), "Resuming navigation");
+          if (g_wasPreviouslyNavigating){
+            geometry_msgs::msg::PoseStamped resume_goal;
+            resume_goal.header.stamp = rclcpp::Clock().now();
+            resume_goal.header.frame_id = "map";
+            resume_goal.pose.position.x = g_curr_goal.x_coord;
+            resume_goal.pose.position.y =  g_curr_goal.y_coord;
+            resume_goal.pose.position.z = 0.0;
+            resume_goal.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(0);
+
+            g_wasPreviouslyNavigating = false;
+            g_isNavigating = true;
+
+            startNavigation(resume_goal);
+          }
+        }
+      }
+      else{
+        RCLCPP_INFO(this->get_logger(), "Invalid message");
+        ; // Do nothing
+      }
+    }
+
+    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) 
+    {
+
+      std::string fromFrameRel = "base_link";
+      std::string toFrameRel = "map";
+
+      geometry_msgs::msg::TransformStamped transformStamped;
+
+      // Look up for the transformation between map frame and base_link frame
+      try {
+        transformStamped = tf_buffer_->lookupTransform(
+          toFrameRel, fromFrameRel,
+          tf2::TimePointZero);
+        g_isCurrPoseAvailable = true;
+      } catch (tf2::TransformException & ex) {
+        RCLCPP_INFO(
+          this->get_logger(), "Could not transform %s to %s: %s",
+          toFrameRel.c_str(), fromFrameRel.c_str(), ex.what());
+      }
+
+      double tx =  transformStamped.transform.translation.x;
+      double ty =  transformStamped.transform.translation.y;
+      g_curr_x = tx;
+      g_curr_y = ty;
+    }
+
+    void autosavemap_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
+    {
+      using namespace cv;
+      
+      g_resolution = msg->info.resolution;
+      g_origin_x = msg->info.origin.position.x;
+      g_origin_y = msg->info.origin.position.y;
+
+      // Initialize pointer to data
+      uint8_t *data = (uint8_t*) msg->data.data(),
+             cur_point = data[0];
+
+      bool isMapEmpty = false;
+      Mat im(msg->info.height, msg->info.width, CV_8UC1);
+
+      // Constexpr variable declaration
+      int kFreeCellCarto = this->get_parameter("mapping_param.int_free_cell_threshold").as_int();
+      int kOccupiedLowCellCarto = this->get_parameter("mapping_param.int_occupied_cell_lower_threshold").as_int();
+      int kOccupiedHighCellCarto = this->get_parameter("mapping_param.int_occupied_cell_upper_threshold").as_int();
+      int kUnknownCellCarto = this->get_parameter("mapping_param.int_unknown_cell_threshold").as_int();
+      int kWhitePixel = this->get_parameter("image_param.int_white_pixel_value").as_int();
+      int kBlackPixel = this->get_parameter("image_param.int_black_pixel_value").as_int();
+      int kGrayPixel = this->get_parameter("image_param.int_grey_pixel_value").as_int();
+
+      std::ofstream myfile;
+      myfile.open ("map_values.txt");
+      myfile << "Writing this to a file.\n";
+
+      // transform the map in the same way the map_saver component does by populating the image matrix with the corresponding pixel values
+      for (size_t i=0; i<msg->data.size(); i++)
+      {
+        // Save the values in a text file
+
+        myfile << int(data[i]);
+        myfile << (" ");
+        if (data[i] == kFreeCellCarto)        
+          im.data[i] = kWhitePixel;
+        else if (data[i] >= kOccupiedLowCellCarto and data[i] <= kOccupiedHighCellCarto) 
+          im.data[i] = kBlackPixel;
+        else 
+          im.data[i] = kGrayPixel;
+
+        // Verify if the map has values
+        if (i!=0) 
+        {
+          isMapEmpty = isMapEmpty || (data[i] != cur_point);
+        }
+        cur_point = data[i];
+      }
+
+      myfile.close();
+
+      // sanity check
+      if (!isMapEmpty) {  RCLCPP_INFO(this->get_logger(),"map is empty, ignoring update."); }
+
+      flip(im, im, 0); // Flip the image in the x-axis
+      imwrite( "map.pgm", im );
+
+      // Choose the next best pose from the image saved
+      if (!g_isMappingEnded){
+        if (!g_isNavigating and g_isCurrPoseAvailable)
+        {
+          if (g_num_of_times_failed == 0 and !g_isHoldingState){ // Select pose globally only when it is not re-attempting
+            global_goal_selector();
+          }
+        }  
+      }       
+    }
+    
+    void global_goal_selector()
+    {
+      RCLCPP_INFO(this->get_logger(), "Global Pose Selection");
+      master_node_feedback("Selecting a Global Position to explore.");
+
+      using namespace cv;
+      double search_grid_row = this->get_parameter("search_grid_param.double_row_width").as_double(); // must be an odd number PREV: 61
+      double search_grid_col = this->get_parameter("search_grid_param.double_col_height").as_double(); // must be an odd number PREV: 61
+      double search_grid_step = this->get_parameter("search_grid_param.double_step_size").as_double();
+      int kRow = metres_to_pixels(search_grid_row);
+      int kCol = metres_to_pixels(search_grid_col);
+      int kStepSize = metres_to_pixels(search_grid_step);
+      int kWhitePixel = this->get_parameter("image_param.int_white_pixel_value").as_int();
+      int kBlackPixel = this->get_parameter("image_param.int_black_pixel_value").as_int();
+
+      // For optimization equation
+      double robot_radius = this->get_parameter("optimization_param.double_robot_radius").as_double(); // In terms of pixels 
+      int kRobotRadius = metres_to_pixels(robot_radius);
+      double kDistTooNearMetres = this->get_parameter("optimization_param.double_dist_too_near_metres").as_double();
+      int size_of_search_grid = kRow*kCol;
+      double occupied_weight = this->get_parameter("optimization_param.double_occupied_pixel_weight").as_double();
+      double free_weight = this->get_parameter("optimization_param.double_free_pixel_weight").as_double();
+      double unknown_weight = this->get_parameter("optimization_param.double_unknown_pixel_weight").as_double();
+      double kAlpha = this->get_parameter("optimization_param.double_dist_weight").as_double(); // Undecided
+      int kBeta = this->get_parameter("optimization_param.int_non_explorable_grid_weight").as_int(); // Undecided
+      double kSafetyFactor = this->get_parameter("optimization_param.double_safety_factor").as_double();
+      double kGamma = occupied_weight/size_of_search_grid; 
+      double kTheta = free_weight/size_of_search_grid; 
+      double kOmega = unknown_weight/size_of_search_grid; 
+      double kBadGoalOption = this->get_parameter("optimization_param.double_bad_goal_preference_value").as_double(); // Undecided
+      double kFactionUnknown = this->get_parameter("optimization_param.double_faction_of_unknown").as_double();
+      
+      std::vector<double> most_preferred_grid_coords;
+      double most_preferred_grid_value = 0; 
+      double grid_preference_value = 0;
+      double dist_from_goal;
+      int num_free_cells = 0;
+      int num_occupied_cells = 0;
+      int num_unknown_cells = 0;
+      bool isExploredArea = false;
+      bool not_explorable_grid = true;
+      bool isFreePresent = false;
+      bool isUnknownPresent = false;
+      bool isBadlandingSpot = false;
+      bool isMapFound = false;
+
+      Mat search_grid = Mat::zeros(kRow,kCol,CV_8UC1);
+
+      Mat im = imread("map.pgm", CV_8UC1);
+
+      while (!isMapFound) {
+        if (im.empty()) {
+          Mat im = imread("map.pgm", CV_8UC1);
+        }
+        else {
+          isMapFound = true;
+        }
+      }
+
+      // Get information from the search grid
+      for(int i = kRow/2; i < im.rows - kRow/2; i=i+kStepSize) { // Transversing along the map image row     Prev increment: 50, 55(crash)
+        for(int j = kCol/2; j < im.cols - kCol/2; j=j+kStepSize) { // Transversing along the map image column    Prev increment: 50, 55(crash)
+          if (im.at<unsigned char>(i,j) != kWhitePixel) {
+            // Skipping this pixel
+            continue;
+          }
+          
+          isBadlandingSpot = false;
+
+          // Checking landing space to see if goal is free of obstacles
+          for (int i_surrounding = i-kRobotRadius; i_surrounding < i+kRobotRadius; i_surrounding++){
+            for(int j_surrounding = j-kRobotRadius; j_surrounding < j+kRobotRadius; j_surrounding++){
+              auto current_pose = im.at<unsigned char>(i_surrounding,j_surrounding);
+              if(current_pose == kBlackPixel){
+                isBadlandingSpot = true;
+              }
+            }
+          }
+
+          if(isBadlandingSpot){
+            // Skipping this pixel: No space to land
+            continue;
+          }
+
+          // Check to see if that area has been explored?
+          if (g_goals_explored_vector.size() != 0) {
+            isExploredArea = check_if_explored(i,j);
+
+            if(isExploredArea){
+              continue;
+            }
+          }
+          // For debugging 
+          std::cout << "current_pose (pixel): " << "j: " << j << " i: " << i << std::endl;
+
+          // Get data from the search grid
+          for(int x = 0; x < kRow; x++) { // Transversing along the search_grid row
+            for(int y = 0; y < kCol; y++) { // Transversing along the search_grid column
+              if (im.at<unsigned char>(i-kRow/2+x,j-kCol/2+y) == kWhitePixel) { 
+                num_free_cells += 1;
+                isFreePresent = true;
+              }
+              else if (im.at<unsigned char>(i-kRow/2+x,j-kCol/2+y) == kBlackPixel) {
+                num_occupied_cells += 1;
+              }
+              else { 
+                num_unknown_cells += 1;
+                double faction_unknown = kFactionUnknown;
+                if (num_unknown_cells >= std::round(faction_unknown*kRow*kCol)){ // Only consider grids with more than 20% unknown
+                  isUnknownPresent = true;
+                }
+              }
+            }
+          }
+
+          // Check if the search grid is feasible for exploration
+          if (isFreePresent == true and isUnknownPresent == true) {
+            // Explorable
+            not_explorable_grid = false;
+          }
+
+          // Determine the grid preference value
+          if (isExploredArea) { // Default is false
+            grid_preference_value = kBadGoalOption;
+          }
+          else {
+            image_goal starting_goal = ros_coord_to_image_coords(g_curr_x, g_curr_y);
+            
+            image_goal target_goal;
+            target_goal.i_coord = i;
+            target_goal.j_coord = j; 
+    
+            dist_from_goal = get_astar_dist(starting_goal, target_goal, im.rows, im.cols);
+
+            // Get preferrence value for the grid
+            if (dist_from_goal > kDistTooNearMetres) {
+              grid_preference_value = kSafetyFactor
+                                  + kAlpha*1/dist_from_goal // Range: 0 to 1
+                                  - kBeta*((int)not_explorable_grid) // Range: 0 or very large number
+                                  - kGamma*((double)num_occupied_cells) // Range: 0 to 
+                                  - kTheta*((double)num_free_cells) // Range: 0 to
+                                  + kOmega*((double)num_unknown_cells); // Range: 0 to 
+              
+              // For tuning visualization
+              debug_goal debug_curr_coords;
+              debug_curr_coords.x_coord = j;
+              debug_curr_coords.y_coord = i;
+              debug_curr_coords.preference_value = grid_preference_value;
+              g_debug_goal_vector.push_back(debug_curr_coords);
+            }
+            else {
+              // Too close
+              grid_preference_value = kBadGoalOption;
+            }
+          }
+          
+          // Assign minimum explored grid
+          if (grid_preference_value > most_preferred_grid_value) {
+            most_preferred_grid_value = grid_preference_value;
+            most_preferred_grid_coords.clear();
+
+            // Save the grid coordinates in ROS coordinates form
+            goal most_preferred_goal = image_coord_to_ros_coords(i, j);
+
+            most_preferred_grid_coords.push_back(most_preferred_goal.x_coord);
+            most_preferred_grid_coords.push_back(most_preferred_goal.y_coord);
+          }
+          g_debug_most_preferred_grid_value = most_preferred_grid_value;
+          // Reset grid values
+          num_free_cells = 0;
+          num_occupied_cells = 0;
+          num_unknown_cells = 0;
+          isFreePresent = false;
+          isUnknownPresent = false;
+          not_explorable_grid = true;
+          dist_from_goal = 0;      }
+      }
+
+      // Check if mapping has ended 
+      int end_checker = most_preferred_grid_value*1000;
+      if(end_checker == 0 or most_preferred_grid_coords.size() == 0) {
+        RCLCPP_INFO(this->get_logger(),"Mapping has ended. Returning to origin");
+        master_node_feedback("Mapping has ended. Returning to origin.");
+
+        //Send command to go origin
+        g_isReturningToOrigin = true;
+        g_isNavigating = true;
+
+        geometry_msgs::msg::PoseStamped origin_goal;
+        origin_goal.header.stamp = rclcpp::Clock().now();
+        origin_goal.header.frame_id = "map";
+        origin_goal.pose.position.x = 0.0;
+        origin_goal.pose.position.y =  0.0;
+        origin_goal.pose.position.z = 0.0;
+        origin_goal.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(0);
+
+        g_prev_x = g_curr_x;
+        g_prev_y = g_curr_y;
+
+        // Append to list of goal pose
+        goal curr_goal;
+        curr_goal.x_coord = origin_goal.pose.position.x;
+        curr_goal.y_coord = origin_goal.pose.position.y;
+        g_goals_sent_vector.push_back(curr_goal);
+
+        // Global curr variable
+        g_curr_goal = curr_goal;
+
+        global_pose_selector_tuning_visualizer();
+        g_debug_goal_vector.clear();
+
+        mark_key_locations();
+
+        RCLCPP_INFO(this->get_logger(),"Grid coords sent");
+
+        for(goal v:g_goals_sent_vector){
+          std::string debug_msg = "(" + std::to_string(v.x_coord) + "," + std::to_string(v.y_coord) + ") ";
+          RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+        }
+         RCLCPP_INFO(this->get_logger(),"") ;
+
+        startNavigation(origin_goal);
+      }
+
+      //Show all values in visited_grid_coords
+      RCLCPP_INFO(this->get_logger(),"Visited grid coords" );
+      for(goal v:g_goals_explored_vector){
+        std::string debug_msg = "(" + std::to_string(v.x_coord) + "," + std::to_string(v.y_coord) + ") " ;
+        RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+      }
+      RCLCPP_INFO(this->get_logger(), "");
+
+      std::string debug_msg = "Most preferred value: " + std::to_string(most_preferred_grid_value);
+      RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+      // Then reset the grid_prefence_value to a low value again to not have an absolute high value saved
+      most_preferred_grid_value = 0;
+
+      if (!most_preferred_grid_coords.empty())
+      {
+        std::string debug_msg = "Most preferred grid coords: (" + std::to_string(most_preferred_grid_coords.at(0)) + "," + std::to_string(most_preferred_grid_coords.at(1)) + ")";
+        RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+
+        geometry_msgs::msg::PoseStamped global_goal;
+        global_goal.header.stamp = rclcpp::Clock().now();
+        global_goal.header.frame_id = "map";
+        global_goal.pose.position.x = most_preferred_grid_coords.at(0);
+        global_goal.pose.position.y =  most_preferred_grid_coords.at(1);
+        global_goal.pose.position.z = 0.0;
+        global_goal.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(0);  
+        
+        g_prev_x = g_curr_x;
+        g_prev_y = g_curr_y;
+
+        g_isNavigating = true;
+
+        // Append to list of goal pose
+        goal curr_goal;
+        curr_goal.x_coord = global_goal.pose.position.x;
+        curr_goal.y_coord = global_goal.pose.position.y;
+        g_goals_sent_vector.push_back(curr_goal);
+
+        // Global curr variable
+        g_curr_goal = curr_goal;
+
+        global_pose_selector_tuning_visualizer();
+        g_debug_goal_vector.clear();
+
+        mark_key_locations();
+
+        RCLCPP_INFO(this->get_logger(), "Grid coords sent");
+        for(goal v:g_goals_sent_vector){
+          std::string debug_msg = "(" + std::to_string(v.x_coord) + "," +  std::to_string(v.y_coord) + ") ";
+          RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+        }
+        RCLCPP_INFO(this->get_logger(), "");
+
+        startNavigation(global_goal);
+      }
+    }
+      
+    void global_pose_selector_tuning_visualizer(){
+      using namespace cv;
+
+      RCLCPP_INFO(this->get_logger(), "Marking Debug Locations");
+      Mat debug_im = imread("map.pgm", CV_8UC1);
+      cvtColor(debug_im, debug_im, cv::COLOR_GRAY2RGB);
+
+      for (debug_goal d_g:g_debug_goal_vector){
+        int radiusCircle = this->get_parameter("mark_key_location_param.int_radius_of_mark").as_int();
+        int thicknessCircle = this->get_parameter("mark_key_location_param.int_thickness_of_circle").as_int();
+        int max_colour_intensity = 255;
+        int intensity_scaling_factor = 5; // to be based on the range of colour intensities
+        int x_debug = d_g.x_coord,
+            y_debug = d_g.y_coord;
+
+        Vec3b & color2 = debug_im.at<Vec3b>(y_debug,x_debug); 
+        color2[0] = 100;
+        color2[1] = 0;
+        color2[2] = 0;
+        int colour_intensity = d_g.preference_value / g_debug_most_preferred_grid_value * max_colour_intensity;
+        cv::Point centerCircle2(x_debug,y_debug);
+
+        if (colour_intensity == max_colour_intensity){
+            cv::Scalar colorCircle2(0, max_colour_intensity,0);
+            cv::circle(debug_im, centerCircle2, radiusCircle, colorCircle2, thicknessCircle);
+        }
+        else{
+            int colour_intensity_diff = max_colour_intensity - colour_intensity;
+            cv::Scalar colorCircle2(colour_intensity_diff*intensity_scaling_factor,0,0);
+            cv::circle(debug_im, centerCircle2, radiusCircle, colorCircle2, thicknessCircle);
+        }
+
+        //std::cout << colour_intensity << std::endl;
+        std::string saved_debug_map_file_location = g_homedir_string + "/picture/map_debug.png";
+        imwrite(saved_debug_map_file_location, debug_im);
+      }
+    }
+
+    double get_astar_dist(image_goal starting_goal, image_goal target_goal, int num_of_row, int num_of_col)
+    {
+      using namespace cv;
+      int kWhitePixel = this->get_parameter("image_param.int_white_pixel_value").as_int();
+      int kGrayPixel = this->get_parameter("image_param.int_grey_pixel_value").as_int();
+      int kBadGoalDefaultMetres = this->get_parameter("a_star_search_algorithm_param.int_rejected_path_metres").as_int();
+
+      // Create the PathFinding stuff and the opencv image to load the image
+      PathFinder<Square> p;
+      
+      // Create an opencv image
+      Mat im3 = imread("map.pgm", CV_8UC1);
+      std::vector<Square*> path;
+
+      // Reverse order (x is col (width) and y is row (height))
+      int width = num_of_col;
+      int height = num_of_row;
+
+      // Pixel coords for distance measure
+      int w1 = starting_goal.j_coord,
+          h1 = starting_goal.i_coord, // starting coords (current pose, height)
+          w2 = target_goal.j_coord,
+          h2 = target_goal.i_coord;   
+
+      /*  Now let's create the nodes, one for each pixel
+        the opencv stuff is pretty self-explanatory  */
+      Square **squares;
+
+      squares = new Square* [width];
+      for(unsigned short int w = 0; w < width; ++w)
+      {
+        squares[w] = new Square[height];
+        for(unsigned short int h = 0; h < height; ++h)
+        {
+          squares[w][h].setPosition(w, h);
+          squares[w][h].setType(im3.at<unsigned char>(h,w) == kWhitePixel ? true : false);
+        }
+      }
+
+      /* And setup the relations between nodes. In this case,
+      we want to create a link between pixels that are
+      next to each other (so that a pixel has 8 neighbours) */
+      int newW, newH;
+      Square *aChild;
+      for(int w = 0; w < width; ++w)
+      {
+        for(int h = 0; h < height; ++h) // traverse all squares
+        {
+          for(int i = -1; i < 2; ++i)
+          {
+            newW = squares[w][h].getX() + i;
+            for(int j = -1; j < 2; ++j) // for all squares in this 3*3 square
+            {
+              newH = squares[w][h].getY() + j;
+              if( newW > -1 && newW < width && newH > -1 && newH < height) // be sure not to go outside the limits
+              {
+                aChild = &(squares[newW][newH]);
+                if( aChild->getType() && (newW != w || newH != h) ) // only take free squares and not the one we are examining
+                  squares[w][h].addChild(aChild, squares[w][h].localDistanceTo(aChild));
+              }
+            }
+          }
+        }
+      }
+
+      p.setStart(squares[w1][h1]);
+      p.setGoal(squares[w2][h2]);
+      
+      // Do some timing stuff for fun
+      auto before = std::chrono::high_resolution_clock::now();
+      bool isPathFound = p.findPath<AStar>(path);
+      auto after = std::chrono::high_resolution_clock::now();
+      auto diff = after - before;
+      float count = std::chrono::duration<float, std::milli>(diff).count();
+
+      if (isPathFound && path.size() > 3)
+      {
+        double path_size_metres = path.size()*g_resolution;
+        
+        for(unsigned short int w = 0; w < width; ++w)
+          delete[] squares[w];
+        delete[] squares;
+
+        return path_size_metres; // placeholder
+      }
+      else if(isPathFound && path.size() <=3)
+      {
+        std::cout << "Path is too short" << std::endl;
+        return -kBadGoalDefaultMetres;
+      }
+      else
+      {
+        std::cout << "No path" << std::endl;
+        return kBadGoalDefaultMetres;
+      }
+    }
+
+    // Convert all to double
+    bool check_if_explored(int i, int j)
+    {
+      bool isExplored = false;
+      int num_of_explored_coords = g_goals_explored_vector.size();
+      double exploration_tolerance = this->get_parameter("region_explored_param.double_exploration_tolerance").as_double();
+      double misalignment_allowance = this->get_parameter("region_explored_param.double_misalignment_allowance").as_double();
+
+      goal curr_goal = image_coord_to_ros_coords(i,j);
+
+      double curr_grid_pose_x = curr_goal.x_coord,
+             curr_grid_pose_y = curr_goal.y_coord;
+
+      // Check if coords to be explored is in the closed vicinity of previously explored coordinates
+      for(int c = 0; c < num_of_explored_coords; c++)
+      {
+        double visted_x = g_goals_explored_vector.at(c).x_coord,
+               visted_y = g_goals_explored_vector.at(c).y_coord;
+
+        double lower_x = visted_x - exploration_tolerance,
+               upper_x = visted_x + exploration_tolerance,
+               lower_y = visted_y - exploration_tolerance,
+               upper_y = visted_y + exploration_tolerance;
+
+        if((curr_grid_pose_x > lower_x) and (curr_grid_pose_x < upper_x)){
+          if((curr_grid_pose_y > lower_y) and (curr_grid_pose_y < upper_y)){
+            isExplored=true;
+	    return isExplored;
+          }
+          else{
+            // Leave current isExplored status
+            ;
+          }
+        }
+        if (num_of_explored_coords <=0)
+          break;
+      }
+      return isExplored;
+    }
+
+    bool check_if_near_previous_scan()
+    {
+      bool isNearPrevScanGoal = false;
+      int num_of_scanned_coords = g_goals_scanned_vector.size();
+      double scan_distance_threshold = this->get_parameter("navigation_status_param.double_scan_distance_threshold").as_double();
+      double scan_misalignment_allowance = this->get_parameter("region_explored_param.double_misalignment_allowance").as_double();
+
+      double curr_grid_pose_x = g_curr_goal.x_coord,
+             curr_grid_pose_y = g_curr_goal.y_coord;
+
+      // Check if coords to be explored is in the closed vicinity of previously explored coordinates
+      for(int c = 0; c < num_of_scanned_coords; c++)
+      {
+        double scanned_x = g_goals_scanned_vector.at(c).x_coord,
+               scanned_y = g_goals_scanned_vector.at(c).y_coord;
+
+        double lower_x = scanned_x - scan_distance_threshold,
+               upper_x = scanned_x + scan_distance_threshold,
+               lower_y = scanned_y - scan_distance_threshold,
+               upper_y = scanned_y + scan_distance_threshold;
+
+        if((curr_grid_pose_x > lower_x) and (curr_grid_pose_x < upper_x))
+        {
+          if((curr_grid_pose_y > lower_y) and (curr_grid_pose_y < upper_y))
+          {
+            isNearPrevScanGoal = true;
+            return isNearPrevScanGoal;
+          }
+          else{
+            // Leave current isExplored status
+            ;
+          }
+       }
+
+        if (num_of_scanned_coords <=0)
+          break;
+      }
+
+      return isNearPrevScanGoal;
+    }
+
+    void mark_key_locations(){
+      using namespace cv;
+      Mat im4 = imread("map.pgm", CV_8UC1);
+      cvtColor(im4, im4, cv::COLOR_GRAY2RGB);
+      int radiusCircle = this->get_parameter("mark_key_location_param.int_radius_of_mark").as_int();
+      int thicknessCircle = this->get_parameter("mark_key_location_param.int_thickness_of_circle").as_int();
+
+      // Start location (RED)
+      RCLCPP_INFO(this->get_logger(), "Marking Key Locations (START)");
+      image_goal starting_key_location = ros_coord_to_image_coords(g_curr_x, g_curr_y);
+
+      int x_start = starting_key_location.j_coord,
+          y_start = starting_key_location.i_coord;
+
+      Vec3b & color1 = im4.at<Vec3b>(y_start, x_start); 
+      color1[0] = 0;
+      color1[1] = 0;
+      color1[2] = 100;
+      cv::Point centerCircle1(x_start,y_start);
+      cv::Scalar colorCircle1(0,0,255);
+      cv::circle(im4, centerCircle1, radiusCircle, colorCircle1, thicknessCircle);
+
+      // Goal location (GREEN)
+      RCLCPP_INFO(this->get_logger(), "Marking Key Locations (GOAL)");
+
+      double x_end_double = g_curr_goal.x_coord,  
+             y_end_double = g_curr_goal.y_coord;
+
+      image_goal ending_key_location = ros_coord_to_image_coords(x_end_double, y_end_double);
+
+      int x_end = ending_key_location.j_coord,
+          y_end = ending_key_location.i_coord;
+
+      Vec3b & color2 = im4.at<Vec3b>(y_end,x_end); 
+      color2[0] = 0;
+      color2[1] = 100;
+      color2[2] = 0;
+      cv::Point centerCircle2(x_end,y_end);
+      cv::Scalar colorCircle2(0,255,0);
+      cv::circle(im4, centerCircle2, radiusCircle, colorCircle2, thicknessCircle);
+      
+      g_marker_im_counter++; 
+      std::string name_of_mark_map = "mark_map_" + std::to_string(g_marker_im_counter) + ".png";
+      
+
+      // For data logging
+      imwrite(g_mission_name + "/" + name_of_mark_map, im4 );
+
+      // For the GUI
+      imwrite(g_homedir_string + "/picture/map.png", im4 );
+    }
+
+    int metres_to_pixels(double var_in_metres){
+      int var_in_pixels;
+      var_in_pixels = var_in_metres/g_resolution;
+      return var_in_pixels;
+    }
+
+    void local_goal_selector(){
+      RCLCPP_INFO(this->get_logger(), "Local Pose Selection");
+      master_node_feedback("Selecting a Local Position to explore.");
+
+      using namespace cv;
+      double robot_radius = this->get_parameter("optimization_param.double_robot_radius").as_double(); 
+      int kRobotRadius = metres_to_pixels(robot_radius);
+      int kBlackPixel = this->get_parameter("image_param.int_black_pixel_value").as_int();
+
+      bool isBadlandingSpot = false;
+      double goal_x; 
+      double goal_y; 
+      bool isMapFound = false;
+      bool isLocalGoalFound = false;
+      bool isExploredArea = false;
+
+      // Load the map pgm
+      Mat im = imread("map.pgm", CV_8UC1);
+      while (!isMapFound) {
+        if (im.empty()) {
+          Mat im = imread("map.pgm", CV_8UC1);
+        }
+        else {
+          isMapFound = true;
+        }
+      }
+
+      // Compute a goal near the previously failed goal (TO_DO clean up 9/5/2022)
+      double prev_sent_goal_x = g_curr_goal.x_coord,
+             prev_sent_goal_y = g_curr_goal.y_coord;
+
+      // Get the first spot that has enough landing space based on an updated map and send goal, else send the same goal
+      image_goal prev_sent_goal = ros_coord_to_image_coords(prev_sent_goal_x, prev_sent_goal_y);
+
+      int prev_sent_goal_x_pixel = prev_sent_goal.j_coord,
+          prev_sent_goal_y_pixel = prev_sent_goal.i_coord;
+
+      double local_exploration_scope_metres = this->get_parameter("local_goal_selection_param.double_local_exploration_scope").as_double();
+      int local_perimeter_pixels = metres_to_pixels(local_exploration_scope_metres);
+
+      double search_grid_step = this->get_parameter("local_goal_selection_param.double_step_size").as_double();
+
+      int lower_bound_x = prev_sent_goal_x_pixel - local_perimeter_pixels,
+          upper_bound_x = prev_sent_goal_x_pixel + local_perimeter_pixels,
+          lower_bound_y = prev_sent_goal_y_pixel - local_perimeter_pixels,
+          upper_bound_y = prev_sent_goal_x_pixel + local_perimeter_pixels,
+          step_pixel = metres_to_pixels(search_grid_step); 
+
+      for (int i = lower_bound_y; i < upper_bound_y; i = i + step_pixel){
+        for (int j =  lower_bound_x; j < upper_bound_x; j = j + step_pixel){
+          // Checking landing space if goal is free of obstacles
+          for (int i_surrounding = i-kRobotRadius; i_surrounding < i+kRobotRadius; i_surrounding++){
+            for(int j_surrounding = j-kRobotRadius; j_surrounding < j+kRobotRadius; j_surrounding++){
+              auto current_pose = im.at<unsigned char>(i_surrounding,j_surrounding);
+              if(current_pose == kBlackPixel){
+                isBadlandingSpot = true;
+              }
+              isExploredArea = check_if_explored(i_surrounding,j_surrounding);
+            }
+          }
+          if (isExploredArea == true){
+            goto retry_same_goal;
+          }
+
+          if (!isBadlandingSpot){
+            goal local_goal_to_send = image_coord_to_ros_coords ( i, j);
+
+            goal_x = local_goal_to_send.x_coord;
+            goal_y = local_goal_to_send.y_coord;
+            isLocalGoalFound = true;
+            goto send_local_goal; // subjected to changes
+          }
+        }
+      }
+
+    retry_same_goal:
+      // If no available goal in local region, resend previous goal
+      if(!isLocalGoalFound){
+        goal_x = prev_sent_goal_x;
+        goal_y = prev_sent_goal_y;
+      }
+
+    send_local_goal:
+      // Send goal
+      geometry_msgs::msg::PoseStamped local_goal;
+      local_goal.header.stamp = rclcpp::Clock().now();
+      local_goal.header.frame_id = "map";
+      local_goal.pose.position.x = goal_x;
+      local_goal.pose.position.y =  goal_y;
+      local_goal.pose.position.z = 0.0;
+      local_goal.pose.orientation = nav2_util::geometry_utils::orientationAroundZAxis(0);  
+      
+      // Append to list of goal pose
+      goal curr_goal;
+      curr_goal.x_coord = local_goal.pose.position.x;
+      curr_goal.y_coord = local_goal.pose.position.y;
+      g_goals_sent_vector.push_back(curr_goal);
+
+      g_curr_goal = curr_goal;
+
+      mark_key_locations();
+
+      g_isNavigating = true;
+
+      startNavigation(local_goal);
+    }
+
+
+    void startNavigation(geometry_msgs::msg::PoseStamped pose)    
+    {       
+      try
+      {
+        using namespace std::placeholders;
+        auto is_action_server_ready = navigation_action_client_->wait_for_action_server(std::chrono::seconds(5));
+        if (!is_action_server_ready) {
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "navigate_to_pose action server is not available."
+            " Is the initial pose set?");
+        }
+        
+        NavigateToPose::Goal navigation_goal_;
+        // Send the goal pose
+        navigation_goal_.pose = pose;
+        
+        RCLCPP_INFO(this->get_logger(), "NavigateToPose will be called using the BT Navigator's default behavior tree.");   
+        
+        // Enable result awareness by providing an empty lambda function
+        auto send_goal_options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+        
+        send_goal_options.goal_response_callback = std::bind(&MapExplorer::goal_response_callback, this, _1); 
+        send_goal_options.feedback_callback = std::bind(&MapExplorer::feedback_callback, this, _1, _2);
+        send_goal_options.result_callback = std::bind(&MapExplorer::result_callback, this, _1);   
+     
+        RCLCPP_INFO(this->get_logger(), "start");  
+        std::string debug_msg = "g_isHoldingState: " + std::to_string(g_isHoldingState);
+        RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+
+        navigation_action_client_->async_send_goal(navigation_goal_, send_goal_options);
+      }
+      catch(const std::exception &exc)
+      {
+        std::cerr<< exc.what();
+      }
+
+    }
+
+    void goal_response_callback(std::shared_future<GoalHandleNavigateToPose::SharedPtr> goal_handle)
+    {
+      if (!goal_handle.get()) {
+        RCLCPP_ERROR(this->get_logger(), "Goal was rejected by server");
+        g_isNavigating = false;
+      } else {
+        RCLCPP_INFO(this->get_logger(), "Goal accepted by server, waiting for result");
+      }
+    }
+
+    void feedback_callback(GoalHandleNavigateToPose::SharedPtr, const std::shared_ptr<const NavigateToPose:: Feedback>)
+    {
+      //RCLCPP_INFO(this->get_logger(), "current pose x %f y %f", feedback->current_pose.pose.position.x, feedback->current_pose.pose.position.y);
+    }
+
+    // Add arguments for end poses
+    double get_euclidean_dist(double target_x, double target_y){
+      /*
+      Using the current sent goal and the current pose, find the distance between them. 
+      If the distance is more than a certain threshold, considered waypoint failed
+      */
+      RCLCPP_INFO(this->get_logger(), "Computing Euclidean Distance"); // TO-DO: Clean up 09052022
+
+      double diff_x = target_x - g_curr_x,
+             diff_y = target_y - g_curr_y;
+
+      double dist_from_goal = std::sqrt(std::pow(diff_x,2) + std::pow(diff_y,2));
+
+      std::string debug_msg = "dist_from_goal: " + std::to_string(dist_from_goal);
+      RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+
+      return dist_from_goal;
+    }
+
+    void result_callback(const GoalHandleNavigateToPose::WrappedResult & result)
+    {
+      // Check for result
+      RCLCPP_INFO(this->get_logger(), "Navigation Result Callback");
+      double dist_from_goal = get_euclidean_dist(g_curr_goal.x_coord,g_curr_goal.y_coord);
+      double goal_failed_dist_metres = this->get_parameter("navigation_status_param.double_fail_distance_metres").as_double();
+      double scan_despite_failure_tolerance_metres = this->get_parameter("navigation_status_param.double_scan_despite_failure_tolerance_metres").as_double();
+
+      if (dist_from_goal > goal_failed_dist_metres) {
+        g_num_of_times_failed++; 
+      }
+      else{
+        g_num_of_times_failed = 0;
+      }
+
+      // Outcome when robot returns to origin
+      if(g_isReturningToOrigin){
+        if(g_num_of_times_failed != 0){
+          // Attempt a few more times
+
+          RCLCPP_INFO(this->get_logger(), "Mission Completed. However, robot was not able to return to starting point.");
+          master_node_feedback("Mission Completed. However, robot was not able to return to starting point.");
+        } 
+        else{
+          RCLCPP_INFO(this->get_logger(), "Mission Completed. Robot is back at starting point.");
+          master_node_feedback("Mission Completed. Robot is back at starting point.");
+        } 
+        g_isMappingEnded = true;
+        return;
+      }
+
+      std::string debug_msg = "Number of times failed: " + std::to_string(g_num_of_times_failed);
+      RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+
+      g_isNavigating = false;
+      int num_of_tries_allowed = this->get_parameter("navigation_status_param.int_num_of_retries_allowed").as_int();
+
+      if (g_num_of_times_failed != 0 and g_num_of_times_failed <= num_of_tries_allowed and g_wasPreviouslyNavigating == false){
+        RCLCPP_INFO(this->get_logger(), "Goal not reached. Finding alternate local pose (1)");
+        master_node_feedback("Goal not reached. Finding alternate local pose.");
+        local_goal_selector();
+        return;
+      }
+      else if (g_num_of_times_failed == (num_of_tries_allowed+1) and g_wasPreviouslyNavigating == false){
+        // Check if far from previous goal
+        if(g_goals_explored_vector.size() != 0){
+          double prev_goal_x = g_prev_scan_goal.x_coord;
+          double prev_goal_y = g_prev_scan_goal.y_coord;
+          double dist_from_prev_goal = get_euclidean_dist(prev_goal_x, prev_goal_y);
+
+          if (dist_from_prev_goal > scan_despite_failure_tolerance_metres){
+            // Do a leica scan
+            RCLCPP_INFO(this->get_logger(), "Far enough from previous goal, will do a leica scan");
+            master_node_feedback("Far enough from previous goal, will do a leica scan.");
+
+            // Request Leica scan
+            master_node_feedback("scan_request");
+            
+            // Save the previously sent goal
+            g_prev_scan_goal.x_coord = g_curr_x;
+            g_prev_scan_goal.y_coord = g_curr_y;
+
+          }
+          else{
+            RCLCPP_INFO(this->get_logger(), "Close to previous goal, will not do a leica scan");
+            master_node_feedback("Close to previous goal, will not do a leica scan.");
+          }
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Goal not reached. Finding alternate global pose (2)");
+        master_node_feedback("Goal not reached. Finding global pose.");
+      }
+      else if (g_num_of_times_failed == 0 and g_wasPreviouslyNavigating == false) {
+        RCLCPP_INFO(this->get_logger(), "Goal reached.");
+        master_node_feedback("Goal reached.");
+
+        // If current goal is more than a certain distance from scan goal then scan
+        bool isNearPrevScanGoal = check_if_near_previous_scan();
+
+        if(!isNearPrevScanGoal){
+          // Request Leica scan
+          master_node_feedback("scan_request");
+
+          // Save the previously sent goal
+          g_prev_scan_goal.x_coord = g_curr_x;
+          g_prev_scan_goal.y_coord = g_curr_y;
+          g_goals_scanned_vector.push_back(g_prev_scan_goal);
+        }
+        else {
+          // Continue exploring without scan
+          ;
+        }
+
+      }
+      else { 
+        RCLCPP_INFO(this->get_logger(), "The robot has been paused");
+      }
+      // Add this point to the explored list
+      g_goals_explored_vector.push_back(g_curr_goal);
+      debug_msg = "Explored goal-> X: " + std::to_string(g_curr_goal.x_coord) + " Y: " + std::to_string(g_curr_goal.y_coord);
+      RCLCPP_INFO(this->get_logger(), debug_msg.c_str());
+
+      RCLCPP_INFO(this->get_logger(), "Added new pose to explored list");
+      g_num_of_times_failed = 0; // Reset counter
+    }
+
+    goal image_coord_to_ros_coords (int i, int j) {
+      using namespace cv;
+
+      goal goal_converted;
+      Mat im = imread("map.pgm", CV_8UC1);
+
+      
+      goal_converted.x_coord = g_origin_x + g_resolution*j;
+      goal_converted.y_coord = g_origin_y + (im.rows - i)*g_resolution;
+      
+      return goal_converted;
+    }
+
+    image_goal ros_coord_to_image_coords (double x, double y){
+      using namespace cv;
+
+      image_goal im_goal_converted;
+      Mat im = imread("map.pgm", CV_8UC1);
+
+      im_goal_converted.i_coord = std::round(im.rows-(y-g_origin_y)/g_resolution);
+      im_goal_converted.j_coord = std::round((x-g_origin_x)/g_resolution);
+
+      return im_goal_converted;
+    }
+
+};
+
+int main(int argc, char ** argv)
+{
+  printf("explorer_package package\n");
+
+  // Get home directory
+  const char *homedir;
+
+  if ((homedir = getenv("HOME")) == NULL) {
+    homedir = getpwuid(getuid())->pw_dir;
+  }
+
+  g_homedir_string = homedir;
+
+  // Get the mission_name
+  time_t now = time(0);
+  tm *ltm = localtime(&now);
+  g_mission_name = g_homedir_string
+                 + "/picture/mission_maps/"
+                 + boost::lexical_cast<std::string>(ltm->tm_mday) + "D"
+                 + boost::lexical_cast<std::string>(1 + ltm->tm_mon) + "M"
+                 + boost::lexical_cast<std::string>(1900 + ltm->tm_year) + "Y"
+                 + boost::lexical_cast<std::string>(ltm->tm_hour) + "H" 
+                 + boost::lexical_cast<std::string>(ltm->tm_min) + "M";
+
+  std::string make_mission_dir_string = "mkdir -p " + g_mission_name;
+  system(make_mission_dir_string.c_str());
+  std::cout << "mission_name: " << g_mission_name << std::endl; 
+
+  rclcpp::init(argc, argv);
+  goal initial_pose;
+  initial_pose.x_coord = 0.0;
+  initial_pose.y_coord = 0.0;
+  g_goals_explored_vector.push_back(initial_pose);
+  rclcpp::spin(std::make_shared<MapExplorer>());
+  rclcpp::shutdown();
+  return 0;
+}
